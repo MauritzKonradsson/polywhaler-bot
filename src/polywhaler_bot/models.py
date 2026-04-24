@@ -17,10 +17,10 @@ def utc_now_iso() -> str:
 
 class RawFeedEvent(BaseModel):
     """
-    Structured representation of one visible Polywhaler trade row as extracted
-    during milestone 1.
+    Structured representation of one visible Polywhaler trade row / API trade item
+    as extracted during milestone 1.
 
-    This is intentionally raw and close to the page:
+    This is intentionally raw and close to the source:
     - no lifecycle interpretation
     - no strategy logic
     - no normalization beyond field shaping
@@ -31,6 +31,9 @@ class RawFeedEvent(BaseModel):
     event_fingerprint: str
     source_page: str
     source_url: str
+    source_kind: str | None = None
+    source_payload: dict[str, Any] | None = None
+
     extracted_at_utc: str = Field(default_factory=utc_now_iso)
     feed_seen_at_utc: str | None = None
 
