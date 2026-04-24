@@ -29,9 +29,17 @@ def build_run_id() -> str:
     return f"{ts}-{token_hex(3)}"
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main() -> int:
     settings = get_settings()
     run_id = build_run_id()
+    run_once = env_bool("RUN_ONCE", default=False)
 
     state_store = StateStore(settings.database_path)
     audit_logger = AuditLogger(settings.logs_dir, run_id)
@@ -48,6 +56,7 @@ def main() -> int:
             "playwright_profile_dir": str(settings.playwright_profile_dir),
             "feed_url": settings.polywhaler_feed_url,
             "refresh_interval_seconds": settings.feed_refresh_interval_seconds,
+            "run_once": run_once,
         },
     )
 
@@ -111,8 +120,6 @@ def main() -> int:
             result = feed_extractor.extract_once()
 
             if result.error_message:
-                # We log the cycle-level error here once more at daemon level so
-                # it is visible without scanning every component log line.
                 audit_logger.error(
                     event_type=EVENT_DAEMON_ERROR,
                     component=COMPONENT_MAIN,
@@ -126,7 +133,21 @@ def main() -> int:
                     },
                 )
 
-            # Sleep in small increments so stop signals can be honored promptly.
+            if run_once:
+                audit_logger.info(
+                    event_type=EVENT_DAEMON_STOP,
+                    component=COMPONENT_MAIN,
+                    message="RUN_ONCE=true; exiting after one extraction cycle",
+                    data={
+                        "source_page": result.source_page,
+                        "source_url": result.source_url,
+                        "row_count": result.row_count,
+                        "session_healthy": result.session_healthy,
+                        "login_required": result.login_required,
+                    },
+                )
+                break
+
             remaining = settings.feed_refresh_interval_seconds
             while remaining > 0 and not stop_requested:
                 time.sleep(1)
