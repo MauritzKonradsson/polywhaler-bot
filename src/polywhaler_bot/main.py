@@ -51,13 +51,6 @@ def main() -> int:
         },
     )
 
-    state_store.set_runtime_state(
-        RuntimeStateRecord(
-            state_key=STATE_DAEMON_LAST_START_UTC,
-            state_value=utc_now_iso(),
-        )
-    )
-
     audit_logger.info(
         event_type=EVENT_DB_INIT_STARTED,
         component=COMPONENT_MAIN,
@@ -65,6 +58,14 @@ def main() -> int:
         data={"database_path": str(settings.database_path)},
     )
     state_store.initialize()
+
+    state_store.set_runtime_state(
+        RuntimeStateRecord(
+            state_key=STATE_DAEMON_LAST_START_UTC,
+            state_value=utc_now_iso(),
+        )
+    )
+
     audit_logger.info(
         event_type=EVENT_DB_INIT_COMPLETED,
         component=COMPONENT_MAIN,

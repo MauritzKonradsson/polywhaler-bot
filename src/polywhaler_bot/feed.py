@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import re
-from urllib.parse import urlparse
+import json
+from typing import Any
+from urllib.parse import urlencode, urljoin
 
-from playwright.sync_api import Error, Locator, Page, TimeoutError
+from playwright.sync_api import Error, Page
 
 from polywhaler_bot.audit import AuditLogger
 from polywhaler_bot.config import Settings
@@ -16,9 +17,6 @@ from polywhaler_bot.constants import (
     EVENT_FEED_EXTRACT_EMPTY,
     EVENT_FEED_EXTRACT_ERROR,
     EVENT_FEED_EXTRACT_SUCCESS,
-    EVENT_FEED_REFRESH_COMPLETED,
-    EVENT_FEED_ROW_PARSED,
-    EVENT_FEED_SELECTOR_MISS,
     EVENT_RAW_EVENT_CREATED,
     EVENT_RAW_EVENT_PERSISTED,
     EVENT_RAW_EVENT_PERSISTENCE_ERROR,
@@ -32,7 +30,6 @@ from polywhaler_bot.constants import (
 from polywhaler_bot.db import StateStore
 from polywhaler_bot.models import (
     FeedExtractionResult,
-    ParsedRow,
     RawFeedEvent,
     RuntimeStateRecord,
     utc_now_iso,
@@ -42,12 +39,12 @@ from polywhaler_bot.session import PolywhalerSessionManager
 
 class PolywhalerFeedExtractor:
     """
-    Milestone 1 deterministic feed extractor.
+    Milestone 1 network-first feed extractor.
 
     Responsibilities:
-    - trigger refresh/extract cycles against the current Polywhaler feed page
-    - verify session health before extracting
-    - parse visible feed rows into structured raw events
+    - ensure the authenticated /deep page/session is usable
+    - call /api/trades from inside the authenticated browser/page context
+    - parse trades[] items into RawFeedEvent objects
     - persist raw events to SQLite
     - write JSONL audit logs
 
@@ -57,20 +54,8 @@ class PolywhalerFeedExtractor:
     - perform trading logic
     """
 
-    SIDE_PATTERN = re.compile(r"\b(YES|NO|BUY|SELL|UP|DOWN)\b", re.IGNORECASE)
-    ADDRESS_PATTERN = re.compile(r"\b0x[a-fA-F0-9]{6,40}\b")
-    IMPACT_PATTERN = re.compile(
-        r"\b(?:low|medium|high)\s+impact\b(?:[:\s-]+[^\n\r]+)?",
-        re.IGNORECASE,
-    )
-    INSIDER_LABEL_LINE_PATTERN = re.compile(
-        r"\b(?:insider|risk|low|moderate|medium|high|yellow|red|blue)\b",
-        re.IGNORECASE,
-    )
-    PROBABILITY_PATTERN = re.compile(r"\b\d{1,3}(?:\.\d+)?%\b")
-    MONEY_PATTERN = re.compile(
-        r"(?i)(\$ ?[\d,]+(?:\.\d+)?[kmb]?|\b[\d,]+(?:\.\d+)? ?(?:USDC|USD)\b)"
-    )
+    SOURCE_PAGE_NAME = "deep_trades_api"
+    SOURCE_KIND = "api_trades"
 
     def __init__(
         self,
@@ -87,7 +72,7 @@ class PolywhalerFeedExtractor:
 
     def extract_once(self) -> FeedExtractionResult:
         """
-        Executes one full refresh/extract/persist cycle.
+        Executes one full session-check / API-fetch / persist cycle.
 
         Returns a FeedExtractionResult summarizing the cycle outcome.
         """
@@ -98,25 +83,23 @@ class PolywhalerFeedExtractor:
             extracted_at_utc,
         )
 
-        page = self._ensure_feed_page_for_cycle()
+        page = self.session_manager.open_feed_page()
 
         self.audit_logger.info(
             event_type=EVENT_FEED_EXTRACT_CYCLE_STARTED,
             component=COMPONENT_FEED_EXTRACTOR,
-            message="Starting Polywhaler feed extraction cycle",
+            message="Starting Polywhaler /api/trades extraction cycle",
             data={
-                "source_page": self.settings.feed_source_page_name,
-                "source_url": page.url,
+                "source_page": self.SOURCE_PAGE_NAME,
+                "page_url": page.url,
             },
         )
 
         try:
-            self._refresh_page(page)
-
             health = self.session_manager.check_health(page)
             if health.status != SESSION_STATUS_HEALTHY:
                 return FeedExtractionResult(
-                    source_page=self.settings.feed_source_page_name,
+                    source_page=self.SOURCE_PAGE_NAME,
                     source_url=health.url or page.url,
                     extracted_at_utc=extracted_at_utc,
                     row_count=0,
@@ -126,37 +109,30 @@ class PolywhalerFeedExtractor:
                     error_message=health.reason,
                 )
 
-            rows = self._get_row_locators(page)
-            if not rows:
-                self.audit_logger.warning(
-                    event_type=EVENT_FEED_SELECTOR_MISS,
-                    component=COMPONENT_FEED_EXTRACTOR,
-                    message="No feed rows matched the configured selector",
-                    data={
-                        "selector": self.settings.feed_row_selector,
-                        "source_page": self.settings.feed_source_page_name,
-                        "source_url": page.url,
-                    },
-                )
+            api_result = self._fetch_trades_api(page)
+            api_url = str(api_result["url"])
+            trades = api_result["trades"]
+
+            if not trades:
                 self.audit_logger.info(
                     event_type=EVENT_FEED_EXTRACT_EMPTY,
                     component=COMPONENT_FEED_EXTRACTOR,
-                    message="Feed extraction completed with zero visible rows",
+                    message="API extraction completed with zero trades",
                     data={
                         "row_count": 0,
-                        "source_page": self.settings.feed_source_page_name,
-                        "source_url": page.url,
+                        "source_page": self.SOURCE_PAGE_NAME,
+                        "source_url": api_url,
                     },
                 )
                 self._set_runtime_state(STATE_FEED_LAST_ROW_COUNT, "0")
-                self._set_runtime_state(STATE_FEED_LAST_SOURCE_URL, page.url)
+                self._set_runtime_state(STATE_FEED_LAST_SOURCE_URL, api_url)
                 self._set_runtime_state(
                     STATE_FEED_LAST_SUCCESSFUL_EXTRACT_UTC,
                     extracted_at_utc,
                 )
                 return FeedExtractionResult(
-                    source_page=self.settings.feed_source_page_name,
-                    source_url=page.url,
+                    source_page=self.SOURCE_PAGE_NAME,
+                    source_url=api_url,
                     extracted_at_utc=extracted_at_utc,
                     row_count=0,
                     events=[],
@@ -166,35 +142,25 @@ class PolywhalerFeedExtractor:
                 )
 
             events: list[RawFeedEvent] = []
-            for row_index, row in enumerate(rows):
+            for row_index, trade in enumerate(trades):
                 try:
-                    parsed = self._parse_row(row=row, row_index=row_index)
-                    raw_event = self._build_raw_event(
-                        parsed=parsed,
-                        source_url=page.url,
+                    raw_event = self._build_raw_event_from_trade_item(
+                        trade=trade,
+                        source_url=api_url,
                         extracted_at_utc=extracted_at_utc,
+                        row_index=row_index,
                     )
 
                     if self.settings.verbose_row_logging:
                         self.audit_logger.info(
-                            event_type=EVENT_FEED_ROW_PARSED,
-                            component=COMPONENT_FEED_EXTRACTOR,
-                            message="Parsed feed row",
-                            data={
-                                "row_index": row_index,
-                                "market_text": raw_event.market_text,
-                                "event_fingerprint": raw_event.event_fingerprint,
-                            },
-                        )
-                        self.audit_logger.info(
                             event_type=EVENT_RAW_EVENT_CREATED,
                             component=COMPONENT_FEED_EXTRACTOR,
-                            message="Created raw feed event",
+                            message="Created raw feed event from /api/trades item",
                             data={
                                 "row_index": row_index,
                                 "market_text": raw_event.market_text,
-                                "side_text": raw_event.side_text,
                                 "event_fingerprint": raw_event.event_fingerprint,
+                                "transaction_hash": trade.get("transactionHash"),
                             },
                         )
 
@@ -203,46 +169,50 @@ class PolywhalerFeedExtractor:
                         self.audit_logger.info(
                             event_type=EVENT_DB_WRITE_RAW_EVENT,
                             component=COMPONENT_FEED_EXTRACTOR,
-                            message="Stored raw event in SQLite",
+                            message="Stored raw API trade event in SQLite",
                             data={
                                 "db_row_id": inserted_id,
                                 "event_fingerprint": raw_event.event_fingerprint,
                                 "market_text": raw_event.market_text,
                                 "row_index": raw_event.row_index,
+                                "source_url": api_url,
                             },
                         )
                         self.audit_logger.info(
                             event_type=EVENT_RAW_EVENT_PERSISTED,
                             component=COMPONENT_FEED_EXTRACTOR,
-                            message="Persisted raw feed event",
+                            message="Persisted raw API trade event",
                             data={
                                 "db_row_id": inserted_id,
                                 "event_fingerprint": raw_event.event_fingerprint,
                                 "market_text": raw_event.market_text,
                                 "row_index": raw_event.row_index,
+                                "source_url": api_url,
                             },
                         )
                     except Exception as exc:
                         self.audit_logger.exception(
                             event_type=EVENT_DB_ERROR,
                             component=COMPONENT_FEED_EXTRACTOR,
-                            message="Database write failed for raw event",
+                            message="Database write failed for API trade event",
                             error=exc,
                             data={
                                 "event_fingerprint": raw_event.event_fingerprint,
                                 "market_text": raw_event.market_text,
                                 "row_index": raw_event.row_index,
+                                "source_url": api_url,
                             },
                         )
                         self.audit_logger.exception(
                             event_type=EVENT_RAW_EVENT_PERSISTENCE_ERROR,
                             component=COMPONENT_FEED_EXTRACTOR,
-                            message="Failed to persist raw feed event",
+                            message="Failed to persist raw API trade event",
                             error=exc,
                             data={
                                 "event_fingerprint": raw_event.event_fingerprint,
                                 "market_text": raw_event.market_text,
                                 "row_index": raw_event.row_index,
+                                "source_url": api_url,
                             },
                         )
                         continue
@@ -253,15 +223,20 @@ class PolywhalerFeedExtractor:
                     self.audit_logger.exception(
                         event_type=EVENT_FEED_EXTRACT_ERROR,
                         component=COMPONENT_FEED_EXTRACTOR,
-                        message="Failed to parse one feed row",
+                        message="Failed to map one /api/trades item into RawFeedEvent",
                         error=exc,
-                        data={"row_index": row_index, "source_url": page.url},
+                        data={
+                            "row_index": row_index,
+                            "source_url": api_url,
+                            "transaction_hash": trade.get("transactionHash"),
+                            "condition_id": trade.get("conditionId"),
+                        },
                     )
                     continue
 
             row_count = len(events)
             self._set_runtime_state(STATE_FEED_LAST_ROW_COUNT, str(row_count))
-            self._set_runtime_state(STATE_FEED_LAST_SOURCE_URL, page.url)
+            self._set_runtime_state(STATE_FEED_LAST_SOURCE_URL, api_url)
             self._set_runtime_state(
                 STATE_FEED_LAST_SUCCESSFUL_EXTRACT_UTC,
                 extracted_at_utc,
@@ -271,28 +246,28 @@ class PolywhalerFeedExtractor:
                 self.audit_logger.info(
                     event_type=EVENT_FEED_EXTRACT_EMPTY,
                     component=COMPONENT_FEED_EXTRACTOR,
-                    message="Feed extraction completed with zero persisted rows",
+                    message="API extraction completed with zero persisted rows",
                     data={
                         "row_count": 0,
-                        "source_page": self.settings.feed_source_page_name,
-                        "source_url": page.url,
+                        "source_page": self.SOURCE_PAGE_NAME,
+                        "source_url": api_url,
                     },
                 )
             else:
                 self.audit_logger.info(
                     event_type=EVENT_FEED_EXTRACT_SUCCESS,
                     component=COMPONENT_FEED_EXTRACTOR,
-                    message="Extracted visible feed rows successfully",
+                    message="Extracted /api/trades items successfully",
                     data={
                         "row_count": row_count,
-                        "source_page": self.settings.feed_source_page_name,
-                        "source_url": page.url,
+                        "source_page": self.SOURCE_PAGE_NAME,
+                        "source_url": api_url,
                     },
                 )
 
             return FeedExtractionResult(
-                source_page=self.settings.feed_source_page_name,
-                source_url=page.url,
+                source_page=self.SOURCE_PAGE_NAME,
+                source_url=api_url,
                 extracted_at_utc=extracted_at_utc,
                 row_count=row_count,
                 events=events,
@@ -305,15 +280,15 @@ class PolywhalerFeedExtractor:
             self.audit_logger.exception(
                 event_type=EVENT_FEED_EXTRACT_ERROR,
                 component=COMPONENT_FEED_EXTRACTOR,
-                message="Feed extraction cycle failed",
+                message="API extraction cycle failed",
                 error=exc,
                 data={
-                    "source_page": self.settings.feed_source_page_name,
-                    "source_url": getattr(page, "url", self.settings.polywhaler_feed_url),
+                    "source_page": self.SOURCE_PAGE_NAME,
+                    "page_url": getattr(page, "url", self.settings.polywhaler_feed_url),
                 },
             )
             return FeedExtractionResult(
-                source_page=self.settings.feed_source_page_name,
+                source_page=self.SOURCE_PAGE_NAME,
                 source_url=getattr(page, "url", self.settings.polywhaler_feed_url),
                 extracted_at_utc=extracted_at_utc,
                 row_count=0,
@@ -323,318 +298,201 @@ class PolywhalerFeedExtractor:
                 error_message=str(exc),
             )
 
-    def _ensure_feed_page_for_cycle(self) -> Page:
+    def _fetch_trades_api(self, page: Page) -> dict[str, Any]:
         """
-        Reuses the current page if it already exists and looks like a Polywhaler page.
-        Navigates only if needed.
+        Calls /api/trades from inside the current authenticated page/session context.
 
-        This prevents unnecessary navigate-then-reload behavior on every cycle.
+        No hidden keys are extracted and no separate auth is built.
+        The browser session remains the auth holder.
         """
-        try:
-            page = self.session_manager.page
-        except RuntimeError:
-            return self.session_manager.open_feed_page()
+        query = urlencode({"time": "24h"})
+        relative_path = f"/api/trades?{query}"
 
-        current_url = getattr(page, "url", "") or ""
-        target_host = urlparse(self.settings.polywhaler_feed_url).netloc
+        script = """
+        async ({ relativePath }) => {
+          const response = await fetch(relativePath, {
+            method: "GET",
+            credentials: "include",
+            headers: {
+              "Accept": "application/json"
+            }
+          });
 
-        if not current_url or current_url == "about:blank":
-            return self.session_manager.open_feed_page()
+          const contentType = response.headers.get("content-type") || "";
+          const text = await response.text();
 
-        if target_host and target_host not in current_url:
-            return self.session_manager.open_feed_page()
-
-        return page
-
-    def _refresh_page(self, page: Page) -> None:
+          return {
+            ok: response.ok,
+            status: response.status,
+            url: response.url,
+            contentType,
+            text
+          };
+        }
         """
-        Refreshes the current page and waits for DOM readiness.
-        """
-        try:
-            page.reload(wait_until="domcontentloaded")
-        except TimeoutError:
-            page.wait_for_load_state("domcontentloaded", timeout=5_000)
 
-        self.audit_logger.info(
-            event_type=EVENT_FEED_REFRESH_COMPLETED,
-            component=COMPONENT_FEED_EXTRACTOR,
-            message="Polywhaler feed page refreshed",
-            data={
-                "source_page": self.settings.feed_source_page_name,
-                "source_url": page.url,
-            },
-        )
+        result = page.evaluate(script, {"relativePath": relative_path})
 
-    def _get_row_locators(self, page: Page) -> list[Locator]:
-        """
-        Returns a list of row locators matching the configured feed row selector.
+        if not isinstance(result, dict):
+            raise RuntimeError("Unexpected /api/trades fetch result shape")
 
-        If selector lookup fails unexpectedly, returns an empty list so the
-        caller falls into selector-miss / empty-extraction handling instead of
-        crashing harder than necessary.
-        """
-        selector = self.settings.feed_row_selector
-        try:
-            locator = page.locator(selector)
-            count = locator.count()
-            return [locator.nth(i) for i in range(count)]
-        except Exception as exc:
-            self.audit_logger.exception(
-                event_type=EVENT_FEED_SELECTOR_MISS,
-                component=COMPONENT_FEED_EXTRACTOR,
-                message="Feed row selector lookup failed unexpectedly",
-                error=exc,
-                data={
-                    "selector": selector,
-                    "source_page": self.settings.feed_source_page_name,
-                    "source_url": getattr(page, "url", self.settings.polywhaler_feed_url),
-                },
+        status = int(result.get("status", 0))
+        ok = bool(result.get("ok", False))
+        content_type = str(result.get("contentType", ""))
+        source_url = str(result.get("url") or urljoin(page.url, relative_path))
+        text = str(result.get("text", ""))
+
+        if not ok:
+            raise RuntimeError(f"/api/trades request failed with status={status}")
+
+        if "json" not in content_type.lower():
+            raise RuntimeError(
+                f"/api/trades returned unexpected content-type={content_type!r}"
             )
-            return []
 
-    def _parse_row(self, *, row: Locator, row_index: int) -> ParsedRow:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"/api/trades JSON parse failed: {exc}") from exc
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("/api/trades payload is not a JSON object")
+
+        trades = payload.get("trades")
+        if not isinstance(trades, list):
+            raise RuntimeError("/api/trades payload does not contain a trades[] list")
+
+        return {
+            "url": source_url,
+            "status": status,
+            "content_type": content_type,
+            "trades": trades,
+            "payload": payload,
+        }
+
+    def _build_raw_event_from_trade_item(
+        self,
+        *,
+        trade: dict[str, Any],
+        source_url: str,
+        extracted_at_utc: str,
+        row_index: int,
+    ) -> RawFeedEvent:
         """
-        Parses one visible DOM row into a lightweight ParsedRow using deterministic
-        text-based heuristics.
-
-        This is intentionally raw for milestone 1 and should not perform any
-        lifecycle interpretation.
+        Maps one /api/trades item into the milestone-1 RawFeedEvent shape.
         """
-        row_text = self._safe_inner_text(row).strip()
-        row_html = self._safe_inner_html(row)
-
-        lines = [line.strip() for line in row_text.splitlines() if line.strip()]
-        if not lines:
-            raise ValueError("row contained no visible text")
-
-        links = self._safe_extract_links(row)
-
-        market_text = self._extract_market_text(lines)
-        side_text = self._extract_first_match(lines, self.SIDE_PATTERN)
-        insider_label_text = self._extract_insider_label(lines)
-        trade_amount_text = self._extract_first_match(lines, self.MONEY_PATTERN)
-        probability_text = self._extract_first_match(lines, self.PROBABILITY_PATTERN)
-        impact_text = self._extract_impact_text(lines)
-        insider_address_text = self._extract_address(lines, links)
-        insider_display_name = self._extract_display_name(
-            lines=lines,
-            market_text=market_text,
-            side_text=side_text,
-            insider_label_text=insider_label_text,
-            trade_amount_text=trade_amount_text,
-            probability_text=probability_text,
-            impact_text=impact_text,
-            insider_address_text=insider_address_text,
+        market_text = self._string_or_none(trade.get("title")) or "<missing-title>"
+        side_text = self._string_or_none(trade.get("side"))
+        insider_address_text = self._string_or_none(trade.get("proxyWallet"))
+        insider_display_name = (
+            self._string_or_none(trade.get("pseudonym"))
+            or self._string_or_none(trade.get("name"))
         )
 
-        return ParsedRow(
+        trade_amount_text = self._format_trade_amount_text(trade)
+        probability_text = self._format_probability_text(trade.get("price"))
+        feed_seen_at_utc = self._string_or_none(trade.get("timestamp"))
+
+        fingerprint = self._compute_trade_fingerprint(trade)
+
+        return RawFeedEvent(
+            event_fingerprint=fingerprint,
+            source_page=self.SOURCE_PAGE_NAME,
+            source_url=source_url,
+            source_kind=self.SOURCE_KIND,
+            source_payload=trade,
+            extracted_at_utc=extracted_at_utc,
+            feed_seen_at_utc=feed_seen_at_utc,
             market_text=market_text,
             side_text=side_text,
-            insider_label_text=insider_label_text,
+            insider_label_text=None,
             insider_address_text=insider_address_text,
             insider_display_name=insider_display_name,
             trade_amount_text=trade_amount_text,
             probability_text=probability_text,
-            impact_text=impact_text,
+            impact_text=None,
             row_index=row_index,
-            row_html=row_html,
+            row_html=None,
         )
 
-    def _build_raw_event(
-        self,
-        *,
-        parsed: ParsedRow,
-        source_url: str,
-        extracted_at_utc: str,
-    ) -> RawFeedEvent:
-        """
-        Converts a ParsedRow into a persisted RawFeedEvent with a stable fingerprint.
-        """
-        fingerprint = self._compute_fingerprint(
-            source_page=self.settings.feed_source_page_name,
-            source_url=source_url,
-            parsed=parsed,
-        )
+    def _compute_trade_fingerprint(self, trade: dict[str, Any]) -> str:
+        transaction_hash = self._string_or_none(trade.get("transactionHash"))
+        condition_id = self._string_or_none(trade.get("conditionId"))
+        proxy_wallet = self._string_or_none(trade.get("proxyWallet"))
+        side = self._string_or_none(trade.get("side"))
+        timestamp = self._string_or_none(trade.get("timestamp"))
+        price = self._string_or_none(trade.get("price"))
+        size = self._string_or_none(trade.get("size"))
 
-        return RawFeedEvent(
-            event_fingerprint=fingerprint,
-            source_page=self.settings.feed_source_page_name,
-            source_url=source_url,
-            extracted_at_utc=extracted_at_utc,
-            feed_seen_at_utc=None,
-            market_text=parsed.market_text,
-            side_text=parsed.side_text,
-            insider_label_text=parsed.insider_label_text,
-            insider_address_text=parsed.insider_address_text,
-            insider_display_name=parsed.insider_display_name,
-            trade_amount_text=parsed.trade_amount_text,
-            probability_text=parsed.probability_text,
-            impact_text=parsed.impact_text,
-            row_index=parsed.row_index,
-            row_html=parsed.row_html,
-        )
+        if transaction_hash:
+            parts = [
+                transaction_hash,
+                condition_id or "",
+                proxy_wallet or "",
+                side or "",
+            ]
+        else:
+            parts = [
+                condition_id or "",
+                proxy_wallet or "",
+                side or "",
+                timestamp or "",
+                price or "",
+                size or "",
+            ]
 
-    def _compute_fingerprint(
-        self,
-        *,
-        source_page: str,
-        source_url: str,
-        parsed: ParsedRow,
-    ) -> str:
-        parts = [
-            source_page,
-            source_url,
-            parsed.market_text or "",
-            parsed.side_text or "",
-            parsed.insider_label_text or "",
-            parsed.insider_address_text or "",
-            parsed.insider_display_name or "",
-            parsed.trade_amount_text or "",
-            parsed.probability_text or "",
-            parsed.impact_text or "",
-            str(parsed.row_index if parsed.row_index is not None else ""),
-        ]
         joined = "||".join(parts)
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
-    def _extract_market_text(self, lines: list[str]) -> str:
-        """
-        Picks the most likely market line using simple deterministic rules:
-        1. first line containing a question mark
-        2. otherwise first line that does not look like side/probability/impact/amount
-        3. fallback to the first non-empty line
-        """
-        for line in lines:
-            if "?" in line:
-                return line
+    def _format_trade_amount_text(self, trade: dict[str, Any]) -> str | None:
+        total_value = trade.get("totalValue")
+        if total_value is not None:
+            numeric = self._float_or_none(total_value)
+            if numeric is not None:
+                return self._format_money(numeric)
+            return self._string_or_none(total_value)
 
-        for line in lines:
-            if self.SIDE_PATTERN.fullmatch(line):
-                continue
-            if self.PROBABILITY_PATTERN.search(line):
-                continue
-            if self.MONEY_PATTERN.search(line):
-                continue
-            if self.IMPACT_PATTERN.search(line):
-                continue
-            if self.INSIDER_LABEL_LINE_PATTERN.search(line):
-                continue
-            if self.ADDRESS_PATTERN.search(line):
-                continue
-            return line
-
-        return lines[0]
-
-    def _extract_insider_label(self, lines: list[str]) -> str | None:
-        """
-        Tries to preserve a useful visible insider/risk label line rather than
-        only returning a single matched word.
-        """
-        for line in lines:
-            if self.INSIDER_LABEL_LINE_PATTERN.search(line):
-                return line
-        return None
-
-    def _extract_impact_text(self, lines: list[str]) -> str | None:
-        """
-        Preserves a useful visible impact label/value such as:
-        - High Impact
-        - Medium Impact
-        - High Impact: 14%
-        """
-        for line in lines:
-            if self.IMPACT_PATTERN.search(line):
-                return line
-        return None
-
-    def _extract_display_name(
-        self,
-        *,
-        lines: list[str],
-        market_text: str,
-        side_text: str | None,
-        insider_label_text: str | None,
-        trade_amount_text: str | None,
-        probability_text: str | None,
-        impact_text: str | None,
-        insider_address_text: str | None,
-    ) -> str | None:
-        ignored = {
-            market_text,
-            side_text,
-            insider_label_text,
-            trade_amount_text,
-            probability_text,
-            impact_text,
-            insider_address_text,
-        }
-
-        for line in lines:
-            if not line or line in ignored:
-                continue
-            if self.PROBABILITY_PATTERN.search(line):
-                continue
-            if self.MONEY_PATTERN.search(line):
-                continue
-            if self.IMPACT_PATTERN.search(line):
-                continue
-            if self.ADDRESS_PATTERN.search(line):
-                continue
-            if self.SIDE_PATTERN.fullmatch(line):
-                continue
-            if self.INSIDER_LABEL_LINE_PATTERN.search(line):
-                continue
-            return line
+        size = trade.get("size")
+        if size is not None:
+            numeric = self._float_or_none(size)
+            if numeric is not None:
+                return self._format_number(numeric)
+            return self._string_or_none(size)
 
         return None
 
-    def _extract_address(self, lines: list[str], links: list[str]) -> str | None:
-        for line in lines:
-            match = self.ADDRESS_PATTERN.search(line)
-            if match:
-                return match.group(0)
+    def _format_probability_text(self, price_value: Any) -> str | None:
+        numeric = self._float_or_none(price_value)
+        if numeric is None:
+            return self._string_or_none(price_value)
 
-        for href in links:
-            match = self.ADDRESS_PATTERN.search(href)
-            if match:
-                return match.group(0)
+        percentage = numeric * 100.0
+        formatted = f"{percentage:.2f}".rstrip("0").rstrip(".")
+        return f"{formatted}%"
 
-        return None
+    def _format_money(self, value: float) -> str:
+        if value.is_integer():
+            return f"${int(value):,}"
+        return f"${value:,.2f}"
 
-    def _extract_first_match(
-        self,
-        lines: list[str],
-        pattern: re.Pattern[str],
-    ) -> str | None:
-        for line in lines:
-            match = pattern.search(line)
-            if match:
-                return match.group(0)
-        return None
+    def _format_number(self, value: float) -> str:
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.6f}".rstrip("0").rstrip(".")
 
-    def _safe_inner_text(self, row: Locator) -> str:
+    def _float_or_none(self, value: Any) -> float | None:
+        if value is None:
+            return None
         try:
-            value = row.inner_text(timeout=self.settings.browser_timeout_ms)
-            return value or ""
-        except Error:
-            return ""
-
-    def _safe_inner_html(self, row: Locator) -> str | None:
-        try:
-            return row.inner_html(timeout=self.settings.browser_timeout_ms)
-        except Error:
+            return float(value)
+        except (TypeError, ValueError):
             return None
 
-    def _safe_extract_links(self, row: Locator) -> list[str]:
-        try:
-            return row.locator("a").evaluate_all(
-                """elements => elements
-                    .map(el => el.getAttribute('href'))
-                    .filter(Boolean)
-                """
-            )
-        except Error:
-            return []
+    def _string_or_none(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
 
     def _set_runtime_state(self, key: str, value: str) -> None:
         self.state_store.set_runtime_state(
