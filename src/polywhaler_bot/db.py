@@ -12,6 +12,7 @@ from polywhaler_bot.constants import (
 )
 from polywhaler_bot.models import (
     CanonicalEvent,
+    LifecycleState,
     NormalizerStateRecord,
     RawFeedEvent,
     RuntimeStateRecord,
@@ -544,6 +545,130 @@ class StateStore:
 
             existing_id = int(existing["id"]) if existing is not None else None
             return existing_id, False
+
+    def get_lifecycle_processing_state(self, state_key: str) -> str | None:
+        return self.get_normalizer_state(state_key)
+
+    def set_lifecycle_processing_state(self, record: NormalizerStateRecord) -> None:
+        self.set_normalizer_state(record)
+
+    def get_canonical_events_after_id(
+        self,
+        *,
+        last_canonical_event_id: int,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = f"""
+            SELECT *
+            FROM {TABLE_CANONICAL_EVENTS}
+            WHERE id > ?
+            ORDER BY id ASC
+        """
+        params: list[Any] = [last_canonical_event_id]
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            payload_json = item.get("source_payload_json")
+            if isinstance(payload_json, str):
+                try:
+                    item["source_payload_json"] = json.loads(payload_json)
+                except json.JSONDecodeError:
+                    pass
+            results.append(item)
+
+        return results
+
+    def get_lifecycle_state_by_key(self, lifecycle_key: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM {TABLE_LIFECYCLE_STATE}
+                WHERE lifecycle_key = ?;
+                """,
+                (lifecycle_key,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        item = dict(row)
+        payload_json = item.get("state_payload_json")
+        if isinstance(payload_json, str):
+            try:
+                item["state_payload_json"] = json.loads(payload_json)
+            except json.JSONDecodeError:
+                pass
+
+        return item
+
+    def upsert_lifecycle_state(self, state: LifecycleState) -> int:
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {TABLE_LIFECYCLE_STATE} (
+                    lifecycle_key, market_text, market_slug, condition_id, asset,
+                    insider_address, insider_display_name, side, current_state,
+                    first_seen_event_id, last_seen_event_id, first_seen_at_utc,
+                    last_seen_at_utc, last_price, last_size, last_total_value,
+                    cumulative_size, cumulative_total_value, event_count,
+                    state_payload_json, created_at_utc, updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lifecycle_key)
+                DO UPDATE SET
+                    market_text = excluded.market_text,
+                    market_slug = excluded.market_slug,
+                    condition_id = excluded.condition_id,
+                    asset = excluded.asset,
+                    insider_address = excluded.insider_address,
+                    insider_display_name = excluded.insider_display_name,
+                    side = excluded.side,
+                    current_state = excluded.current_state,
+                    first_seen_event_id = excluded.first_seen_event_id,
+                    last_seen_event_id = excluded.last_seen_event_id,
+                    first_seen_at_utc = excluded.first_seen_at_utc,
+                    last_seen_at_utc = excluded.last_seen_at_utc,
+                    last_price = excluded.last_price,
+                    last_size = excluded.last_size,
+                    last_total_value = excluded.last_total_value,
+                    cumulative_size = excluded.cumulative_size,
+                    cumulative_total_value = excluded.cumulative_total_value,
+                    event_count = excluded.event_count,
+                    state_payload_json = excluded.state_payload_json,
+                    created_at_utc = excluded.created_at_utc,
+                    updated_at_utc = excluded.updated_at_utc;
+                """,
+                (
+                    state.lifecycle_key, state.market_text, state.market_slug,
+                    state.condition_id, state.asset, state.insider_address,
+                    state.insider_display_name, state.side, state.current_state,
+                    state.first_seen_event_id, state.last_seen_event_id,
+                    state.first_seen_at_utc, state.last_seen_at_utc,
+                    state.last_price, state.last_size, state.last_total_value,
+                    state.cumulative_size, state.cumulative_total_value,
+                    state.event_count, state.state_payload_json,
+                    state.created_at_utc, state.updated_at_utc,
+                ),
+            )
+
+            row = conn.execute(
+                f"SELECT id FROM {TABLE_LIFECYCLE_STATE} WHERE lifecycle_key = ?;",
+                (state.lifecycle_key,),
+            ).fetchone()
+            conn.commit()
+
+            if row is None:
+                raise RuntimeError(f"Failed to upsert lifecycle_state for {state.lifecycle_key}")
+            return int(row["id"])
 
     def count_raw_events(self) -> int:
         """
