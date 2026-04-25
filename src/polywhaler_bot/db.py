@@ -10,7 +10,12 @@ from polywhaler_bot.constants import (
     TABLE_RUNTIME_STATE,
     TABLE_SCHEMA_META,
 )
-from polywhaler_bot.models import RawFeedEvent, RuntimeStateRecord
+from polywhaler_bot.models import (
+    CanonicalEvent,
+    NormalizerStateRecord,
+    RawFeedEvent,
+    RuntimeStateRecord,
+)
 
 # Milestone 2 schema version is intentionally defined here so Step 7.1B can be
 # implemented without requiring any other file changes yet.
@@ -382,6 +387,163 @@ class StateStore:
             if row is None:
                 return None
             return int(row["schema_version"])
+
+    def get_normalizer_state(self, state_key: str) -> str | None:
+        """
+        Returns the current value for a normalizer state key, or None if missing.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT state_value
+                FROM {TABLE_NORMALIZER_STATE}
+                WHERE state_key = ?;
+                """,
+                (state_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row["state_value"])
+
+    def set_normalizer_state(self, record: NormalizerStateRecord) -> None:
+        """
+        Upserts one normalizer checkpoint key/value pair.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {TABLE_NORMALIZER_STATE} (
+                    state_key,
+                    state_value,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(state_key)
+                DO UPDATE SET
+                    state_value = excluded.state_value,
+                    updated_at_utc = excluded.updated_at_utc;
+                """,
+                (record.state_key, record.state_value, record.updated_at_utc),
+            )
+            conn.commit()
+
+    def get_raw_events_after_id(
+        self,
+        *,
+        last_raw_event_id: int,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Returns raw_events with id > last_raw_event_id ordered ascending.
+        row_json is parsed back into a Python object.
+        """
+        query = f"""
+            SELECT *
+            FROM {TABLE_RAW_EVENTS}
+            WHERE id > ?
+            ORDER BY id ASC
+        """
+        params: list[Any] = [last_raw_event_id]
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_json = item.get("row_json")
+            if isinstance(raw_json, str):
+                try:
+                    item["row_json"] = json.loads(raw_json)
+                except json.JSONDecodeError:
+                    item["row_json"] = None
+            results.append(item)
+
+        return results
+
+    def insert_canonical_event(self, event: CanonicalEvent) -> tuple[int | None, bool]:
+        """
+        Inserts a canonical event.
+
+        Returns:
+        - (id, True) if inserted
+        - (existing_id, False) if skipped because event_fingerprint already exists
+        """
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                INSERT OR IGNORE INTO {TABLE_CANONICAL_EVENTS} (
+                    event_fingerprint,
+                    raw_event_id,
+                    canonical_key,
+                    lifecycle_key,
+                    event_type,
+                    market_text,
+                    market_slug,
+                    condition_id,
+                    asset,
+                    insider_address,
+                    insider_display_name,
+                    side,
+                    outcome,
+                    price,
+                    size,
+                    total_value,
+                    source_timestamp_utc,
+                    normalized_at_utc,
+                    source_payload_json,
+                    normalization_notes,
+                    created_at_utc,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    event.event_fingerprint,
+                    event.raw_event_id,
+                    event.canonical_key,
+                    event.lifecycle_key,
+                    event.event_type,
+                    event.market_text,
+                    event.market_slug,
+                    event.condition_id,
+                    event.asset,
+                    event.insider_address,
+                    event.insider_display_name,
+                    event.side,
+                    event.outcome,
+                    event.price,
+                    event.size,
+                    event.total_value,
+                    event.source_timestamp_utc,
+                    event.normalized_at_utc,
+                    event.source_payload_json,
+                    event.normalization_notes,
+                    event.created_at_utc,
+                    event.updated_at_utc,
+                ),
+            )
+
+            if cursor.rowcount == 1:
+                conn.commit()
+                return int(cursor.lastrowid), True
+
+            existing = conn.execute(
+                f"""
+                SELECT id
+                FROM {TABLE_CANONICAL_EVENTS}
+                WHERE event_fingerprint = ?;
+                """,
+                (event.event_fingerprint,),
+            ).fetchone()
+            conn.commit()
+
+            existing_id = int(existing["id"]) if existing is not None else None
+            return existing_id, False
 
     def count_raw_events(self) -> int:
         """
