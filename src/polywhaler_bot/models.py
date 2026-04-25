@@ -50,6 +50,125 @@ class RawFeedEvent(BaseModel):
     row_html: str | None = None
 
 
+class CanonicalEvent(BaseModel):
+    """
+    One normalized logical event derived from a raw_event row.
+
+    Aligned to the schema_version=2 canonical_events table.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    event_fingerprint: str
+    raw_event_id: int
+    canonical_key: str
+    lifecycle_key: str
+    event_type: str
+
+    market_text: str
+    market_slug: str | None = None
+    condition_id: str | None = None
+    asset: str | None = None
+
+    insider_address: str | None = None
+    insider_display_name: str | None = None
+
+    side: str | None = None
+    outcome: str | None = None
+
+    price: float | None = None
+    size: float | None = None
+    total_value: float | None = None
+
+    source_timestamp_utc: str | None = None
+    normalized_at_utc: str = Field(default_factory=utc_now_iso)
+
+    source_payload_json: str | None = None
+    normalization_notes: str | None = None
+
+    created_at_utc: str = Field(default_factory=utc_now_iso)
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+
+class LifecycleState(BaseModel):
+    """
+    Current lifecycle state per market/insider/side.
+
+    Aligned to the schema_version=2 lifecycle_state table.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    lifecycle_key: str
+
+    market_text: str
+    market_slug: str | None = None
+    condition_id: str | None = None
+    asset: str | None = None
+
+    insider_address: str | None = None
+    insider_display_name: str | None = None
+
+    side: str | None = None
+    current_state: str
+
+    first_seen_event_id: int | None = None
+    last_seen_event_id: int | None = None
+
+    first_seen_at_utc: str | None = None
+    last_seen_at_utc: str | None = None
+
+    last_price: float | None = None
+    last_size: float | None = None
+    last_total_value: float | None = None
+
+    cumulative_size: float | None = None
+    cumulative_total_value: float | None = None
+
+    event_count: int = 0
+    state_payload_json: str | None = None
+
+    created_at_utc: str = Field(default_factory=utc_now_iso)
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+
+class NormalizerStateRecord(BaseModel):
+    """
+    Key/value checkpoint state for idempotent normalization runs.
+
+    Aligned to the schema_version=2 normalizer_state table.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    state_key: str
+    state_value: str
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+
+class NormalizationResult(BaseModel):
+    """
+    Lightweight non-table model for reporting one normalization outcome.
+
+    Useful later for run-once normalizer output and testing, but does not map
+    directly to a DB table.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    raw_event_id: int
+    canonical_event_id: int | None = None
+    event_fingerprint: str
+    lifecycle_key: str
+    event_type: str
+    status: str
+    notes: str | None = None
+    processed_at_utc: str = Field(default_factory=utc_now_iso)
+
+
 class RuntimeStateRecord(BaseModel):
     """
     Key/value record for the runtime_state SQLite table.
