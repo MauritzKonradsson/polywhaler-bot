@@ -6,23 +6,35 @@ from pathlib import Path
 from typing import Any
 
 from polywhaler_bot.constants import (
-    SCHEMA_VERSION,
     TABLE_RAW_EVENTS,
     TABLE_RUNTIME_STATE,
     TABLE_SCHEMA_META,
 )
 from polywhaler_bot.models import RawFeedEvent, RuntimeStateRecord
 
+# Milestone 2 schema version is intentionally defined here so Step 7.1B can be
+# implemented without requiring any other file changes yet.
+SCHEMA_VERSION = 2
+
+TABLE_CANONICAL_EVENTS = "canonical_events"
+TABLE_LIFECYCLE_STATE = "lifecycle_state"
+TABLE_NORMALIZER_STATE = "normalizer_state"
+
 
 class StateStore:
     """
-    SQLite-backed state store for milestone 1.
+    SQLite-backed state store.
 
-    Responsibilities:
-    - initialize the SQLite database and schema
+    Current responsibilities:
+    - initialize and migrate the SQLite schema
     - persist raw feed events
     - persist small runtime/session state values
     - provide lightweight read helpers used by the daemon
+
+    Milestone 2 schema additions:
+    - canonical_events
+    - lifecycle_state
+    - normalizer_state
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -38,15 +50,24 @@ class StateStore:
 
     def initialize(self) -> None:
         """
-        Creates the schema for milestone 1 if it does not already exist.
+        Creates and/or migrates the schema to the current version.
+
+        This is idempotent:
+        - existing v1 tables/data are preserved
+        - missing v2 tables/indexes are added
+        - schema_meta singleton row is updated to version 2
         """
         with self.connect() as conn:
-            self._create_tables(conn)
-            self._create_indexes(conn)
-            self._initialize_schema_meta(conn)
+            self._create_v1_tables(conn)
+            self._create_v1_indexes(conn)
+
+            self._create_v2_tables(conn)
+            self._create_v2_indexes(conn)
+
+            self._initialize_or_update_schema_meta(conn)
             conn.commit()
 
-    def _create_tables(self, conn: sqlite3.Connection) -> None:
+    def _create_v1_tables(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {TABLE_RAW_EVENTS} (
@@ -82,8 +103,7 @@ class StateStore:
             """
         )
 
-        # Explicit single-row schema metadata table for milestone 1.
-        # singleton_id must always be 1.
+        # Single-row schema metadata table; singleton_id must always be 1.
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {TABLE_SCHEMA_META} (
@@ -94,7 +114,7 @@ class StateStore:
             """
         )
 
-    def _create_indexes(self, conn: sqlite3.Connection) -> None:
+    def _create_v1_indexes(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_raw_events_fingerprint
@@ -114,7 +134,134 @@ class StateStore:
             """
         )
 
-    def _initialize_schema_meta(self, conn: sqlite3.Connection) -> None:
+    def _create_v2_tables(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_CANONICAL_EVENTS} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_fingerprint TEXT NOT NULL UNIQUE,
+                raw_event_id INTEGER NOT NULL,
+                canonical_key TEXT NOT NULL,
+                lifecycle_key TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                market_text TEXT NOT NULL,
+                market_slug TEXT,
+                condition_id TEXT,
+                asset TEXT,
+                insider_address TEXT,
+                insider_display_name TEXT,
+                side TEXT,
+                outcome TEXT,
+                price REAL,
+                size REAL,
+                total_value REAL,
+                source_timestamp_utc TEXT,
+                normalized_at_utc TEXT NOT NULL,
+                source_payload_json TEXT,
+                normalization_notes TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_LIFECYCLE_STATE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lifecycle_key TEXT NOT NULL UNIQUE,
+                market_text TEXT NOT NULL,
+                market_slug TEXT,
+                condition_id TEXT,
+                asset TEXT,
+                insider_address TEXT,
+                insider_display_name TEXT,
+                side TEXT,
+                current_state TEXT NOT NULL,
+                first_seen_event_id INTEGER,
+                last_seen_event_id INTEGER,
+                first_seen_at_utc TEXT,
+                last_seen_at_utc TEXT,
+                last_price REAL,
+                last_size REAL,
+                last_total_value REAL,
+                cumulative_size REAL,
+                cumulative_total_value REAL,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                state_payload_json TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NORMALIZER_STATE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state_key TEXT NOT NULL UNIQUE,
+                state_value TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+            """
+        )
+
+    def _create_v2_indexes(self, conn: sqlite3.Connection) -> None:
+        # canonical_events
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_canonical_events_raw_event_id
+            ON {TABLE_CANONICAL_EVENTS} (raw_event_id);
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_canonical_events_lifecycle_key
+            ON {TABLE_CANONICAL_EVENTS} (lifecycle_key);
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_canonical_events_event_type
+            ON {TABLE_CANONICAL_EVENTS} (event_type);
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_canonical_events_source_timestamp_utc
+            ON {TABLE_CANONICAL_EVENTS} (source_timestamp_utc);
+            """
+        )
+
+        # lifecycle_state
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_lifecycle_state_current_state
+            ON {TABLE_LIFECYCLE_STATE} (current_state);
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_lifecycle_state_insider_address
+            ON {TABLE_LIFECYCLE_STATE} (insider_address);
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_lifecycle_state_condition_id
+            ON {TABLE_LIFECYCLE_STATE} (condition_id);
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_lifecycle_state_last_seen_at_utc
+            ON {TABLE_LIFECYCLE_STATE} (last_seen_at_utc);
+            """
+        )
+
+        # normalizer_state intentionally has only UNIQUE(state_key); no extra indexes needed.
+
+    def _initialize_or_update_schema_meta(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             f"""
             INSERT INTO {TABLE_SCHEMA_META} (
@@ -271,7 +418,6 @@ class StateStore:
                 try:
                     item["row_json"] = json.loads(raw_json)
                 except json.JSONDecodeError:
-                    # Keep the original string if decoding somehow fails.
                     pass
             results.append(item)
 
