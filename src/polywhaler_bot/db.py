@@ -709,3 +709,33 @@ class StateStore:
             results.append(item)
 
         return results
+
+    def get_recent_canonical_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        """
+        Convenience helper for market-mapping inspection/debugging.
+        Returns recent canonical_events as dictionaries with source_payload_json
+        parsed back into a Python object when possible.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM {TABLE_CANONICAL_EVENTS}
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (limit,),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            payload_json = item.get("source_payload_json")
+            if isinstance(payload_json, str):
+                try:
+                    item["source_payload_json"] = json.loads(payload_json)
+                except json.JSONDecodeError:
+                    pass
+            results.append(item)
+
+        return results

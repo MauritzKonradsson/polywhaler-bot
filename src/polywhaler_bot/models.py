@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ConfigDict
 
 
 def utc_now_iso() -> str:
@@ -133,6 +133,40 @@ class LifecycleState(BaseModel):
     created_at_utc: str = Field(default_factory=utc_now_iso)
     updated_at_utc: str = Field(default_factory=utc_now_iso)
 
+class ResolvedMarket(BaseModel):
+    """
+    Market-mapping result for one canonical event.
+
+    This is a read-only Milestone 4 model and is not persisted in the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    canonical_event_id: int
+    lifecycle_key: str
+
+    status: str  # resolved | ambiguous | failed
+
+    market_slug: str | None = None
+    market_text: str
+    condition_id: str | None = None
+
+    token_id: str | None = None
+    asset: str | None = None
+    outcome: str | None = None
+
+    canonical_side: str | None = None
+    replication_side: str | None = None
+
+    match_method: str | None = None
+    confidence: float = 0.0
+
+    market_active: bool | None = None
+    market_readable: bool | None = None
+    orderbook_available: bool | None = None
+
+    ambiguity_flags: list[str] = Field(default_factory=list)
+    failure_reasons: list[str] = Field(default_factory=list)
 
 class NormalizerStateRecord(BaseModel):
     """
