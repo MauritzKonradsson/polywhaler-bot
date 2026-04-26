@@ -196,6 +196,27 @@ class InsiderVisibilityResult(BaseModel):
 
     reasons: list[str] = Field(default_factory=list)
 
+class GateDecision(BaseModel):
+    """
+    Read-only replication gate decision for one canonical event.
+
+    This is a Milestone 4 model and is not persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    canonical_event_id: int
+    lifecycle_key: str
+
+    decision: str  # pass | fail | ambiguous
+    execution_eligible: bool = False
+
+    reasons: list[str] = Field(default_factory=list)
+    gate_results: dict[str, str] = Field(default_factory=dict)
+
+    resolved_market: ResolvedMarket
+    visibility: InsiderVisibilityResult
+
 class NormalizerStateRecord(BaseModel):
     """
     Key/value checkpoint state for idempotent normalization runs.
