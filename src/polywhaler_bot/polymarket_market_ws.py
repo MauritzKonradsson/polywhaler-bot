@@ -17,7 +17,7 @@ MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 class PolymarketMarketWSError(RuntimeError):
-    """Raised when the public market WebSocket inspection flow fails."""
+    pass
 
 
 @dataclass(slots=True)
@@ -28,34 +28,12 @@ class ResolvedToken:
 
 
 class PolymarketMarketWSClient:
-    """
-    Public market WebSocket validation helper.
-
-    Scope:
-    - public market channel only
-    - no auth
-    - no trading
-    - no DB writes
-    """
-
-    def __init__(
-        self,
-        settings: Settings,
-        *,
-        timeout_seconds: int = 15,
-    ) -> None:
+    def __init__(self, settings: Settings, *, timeout_seconds: int = 15) -> None:
         self.settings = settings
         self.timeout_seconds = timeout_seconds
         self.public_client = PolymarketPublicClient(settings=settings)
 
     def resolve_token_id(self) -> ResolvedToken:
-        """
-        Resolve a token ID for market-channel validation.
-
-        Priority:
-        1. POLYMARKET_TEST_TOKEN_ID if set
-        2. First token_id from public simplified-markets lookup
-        """
         if self.settings.polymarket_test_token_id:
             return ResolvedToken(
                 token_id=self.settings.polymarket_test_token_id,
@@ -66,57 +44,28 @@ class PolymarketMarketWSClient:
         simplified = self.public_client.get_simplified_markets(params={"limit": 1})
         payload = simplified.data
 
-        if not isinstance(payload, dict):
-            raise PolymarketMarketWSError(
-                f"Expected simplified-markets payload to be dict, got {type(payload).__name__}"
-            )
+        if isinstance(payload, dict):
+            data = payload.get("data")
+        elif isinstance(payload, list):
+            data = payload
+        else:
+            raise PolymarketMarketWSError("Invalid simplified-markets payload")
 
-        data = payload.get("data")
-        if not isinstance(data, list) or not data:
-            raise PolymarketMarketWSError(
-                "simplified-markets returned no market data; cannot derive a token_id"
-            )
+        if not data:
+            raise PolymarketMarketWSError("No markets returned")
 
         market = data[0]
-        if not isinstance(market, dict):
-            raise PolymarketMarketWSError(
-                "simplified-markets returned an unexpected market item shape"
-            )
-
-        tokens = market.get("tokens")
-        if not isinstance(tokens, list) or not tokens:
-            raise PolymarketMarketWSError(
-                "simplified-markets returned a market with no tokens[]"
-            )
-
-        token = tokens[0]
-        if not isinstance(token, dict):
-            raise PolymarketMarketWSError(
-                "simplified-markets returned an unexpected token item shape"
-            )
-
-        token_id = token.get("token_id")
-        if not isinstance(token_id, str) or not token_id.strip():
-            raise PolymarketMarketWSError(
-                "simplified-markets token entry did not contain a usable token_id"
-            )
+        token = market["tokens"][0]
 
         return ResolvedToken(
-            token_id=token_id.strip(),
+            token_id=token["token_id"],
             source="simplified_markets",
-            details={
-                "market": market,
-                "token": token,
-                "lookup_url": simplified.url,
-            },
+            details={"market": market, "token": token},
         )
 
     async def receive_first_event(self) -> dict[str, Any]:
-        """
-        Connect to the public market channel, subscribe to one token ID, and
-        return the first payload that contains an event_type.
-        """
         resolved = self.resolve_token_id()
+
         subscription = {
             "assets_ids": [resolved.token_id],
             "type": "market",
@@ -124,78 +73,63 @@ class PolymarketMarketWSClient:
         }
 
         try:
-            async with websockets.connect(
-                MARKET_WS_URL,
-                open_timeout=self.timeout_seconds,
-                close_timeout=5,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=2**20,
-            ) as ws:
+            async with websockets.connect(MARKET_WS_URL) as ws:
                 await ws.send(json.dumps(subscription))
 
                 while True:
-                    raw_message = await asyncio.wait_for(
-                        ws.recv(),
-                        timeout=self.timeout_seconds,
-                    )
+                    raw = await asyncio.wait_for(ws.recv(), timeout=self.timeout_seconds)
 
                     try:
-                        payload = json.loads(raw_message)
+                        payload = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
 
                     print("WS_MESSAGE:", payload)
 
-if isinstance(payload, list) and payload:
-    first = payload[0]
-    if isinstance(first, dict):
-        return {
-            "token_resolution": {
-                "token_id": resolved.token_id,
-                "source": resolved.source,
-                "details": resolved.details,
-            },
-            "subscription": subscription,
-            "event": first,
-        }
+                    # 🔥 HANDLE LIST PAYLOADS (MAIN FIX)
+                    if isinstance(payload, list):
+                        if not payload:
+                            continue
 
-if isinstance(payload, dict):
-    if "event_type" in payload or "asset_id" in payload or "market" in payload:
-        return {
-            "token_resolution": {
-                "token_id": resolved.token_id,
-                "source": resolved.source,
-                "details": resolved.details,
-            },
-            "subscription": subscription,
-            "event": payload,
-        }
-                            "token_resolution": {
-                                "token_id": resolved.token_id,
-                                "source": resolved.source,
-                                "details": resolved.details,
-                            },
-                            "subscription": subscription,
-                            "event": payload,
-                        }
+                        for item in payload:
+                            if isinstance(item, dict):
+                                return {
+                                    "token_resolution": {
+                                        "token_id": resolved.token_id,
+                                        "source": resolved.source,
+                                        "details": resolved.details,
+                                    },
+                                    "subscription": subscription,
+                                    "event": item,
+                                }
 
-        except asyncio.TimeoutError as exc:
+                    # 🔥 HANDLE DICT PAYLOADS
+                    if isinstance(payload, dict):
+                        if (
+                            "event_type" in payload
+                            or "asset_id" in payload
+                            or "market" in payload
+                            or "bids" in payload
+                            or "asks" in payload
+                        ):
+                            return {
+                                "token_resolution": {
+                                    "token_id": resolved.token_id,
+                                    "source": resolved.source,
+                                    "details": resolved.details,
+                                },
+                                "subscription": subscription,
+                                "event": payload,
+                            }
+
+        except asyncio.TimeoutError:
             raise PolymarketMarketWSError(
-                f"Timed out waiting for a market event on token_id={resolved.token_id}"
-            ) from exc
+                f"Timed out waiting for event on token {resolved.token_id}"
+            )
         except PolymarketPublicAPIError as exc:
-            raise PolymarketMarketWSError(
-                f"Token resolution failed via public market lookup: {exc}"
-            ) from exc
-        except websockets.WebSocketException as exc:
-            raise PolymarketMarketWSError(
-                f"Public market WebSocket failed: {exc}"
-            ) from exc
+            raise PolymarketMarketWSError(f"Public API error: {exc}")
         except Exception as exc:
-            raise PolymarketMarketWSError(
-                f"Unexpected public market WebSocket failure: {exc}"
-            ) from exc
+            raise PolymarketMarketWSError(f"Unexpected WS error: {exc}")
 
     def receive_first_event_sync(self) -> dict[str, Any]:
         return asyncio.run(self.receive_first_event())
