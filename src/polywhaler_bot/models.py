@@ -168,6 +168,34 @@ class ResolvedMarket(BaseModel):
     ambiguity_flags: list[str] = Field(default_factory=list)
     failure_reasons: list[str] = Field(default_factory=list)
 
+class InsiderVisibilityResult(BaseModel):
+    """
+    Read-only insider visibility classification result for one canonical event.
+
+    This is a Milestone 4 model and is not persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    canonical_event_id: int
+    lifecycle_key: str
+    insider_address: str | None = None
+
+    status: str  # still_in | partial_reduce | full_exit | flip | ambiguous | unavailable
+
+    matched_condition_id: str | None = None
+    matched_asset: str | None = None
+    matched_outcome: str | None = None
+    matched_size: float | None = None
+    matched_current_value: float | None = None
+
+    reference_last_size: float | None = None
+    reference_last_total_value: float | None = None
+
+    one_recheck_performed: bool = False
+
+    reasons: list[str] = Field(default_factory=list)
+
 class NormalizerStateRecord(BaseModel):
     """
     Key/value checkpoint state for idempotent normalization runs.
