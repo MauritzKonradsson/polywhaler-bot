@@ -511,3 +511,30 @@ class ExecutionSizingResult(BaseModel):
 
     exposure_snapshot: dict[str, float] = Field(default_factory=dict)
     reasons: list[str] = Field(default_factory=list)
+
+class ExecutionReadyIntent(BaseModel):
+    """
+    Read-only execution-ready view derived from an execution intent plus sizing.
+
+    This model is NOT persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    intent_id: int
+    intent_key: str
+    position_key: str
+
+    allowed: bool
+    intended_notional: float | None = None
+    intended_size: float | None = None
+
+    condition_id: str
+    token_id: str
+    outcome: str
+    side: str
+
+    market_slug: str | None = None
+    source_timestamp_utc: str | None = None
+
+    sizing_reasons: list[str] = Field(default_factory=list)
