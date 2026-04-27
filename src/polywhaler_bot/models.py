@@ -564,3 +564,29 @@ class PreExecutionOrder(BaseModel):
 
     pricing_source: str = "mock_static"
     sizing_source: str = "notional_to_size_estimate"
+
+class ExecutionValidationResult(BaseModel):
+    """
+    Read-only validation result for a pre-execution order.
+
+    This model is NOT persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    intent_id: int
+    intent_key: str
+    position_key: str
+    client_order_id: str
+
+    valid: bool
+    reasons: list[str] = Field(default_factory=list)
+
+    price: float
+    size: float
+    notional: float
+
+    condition_id: str
+    token_id: str
+    outcome: str
+    side: str
