@@ -628,3 +628,30 @@ class ExecutionReadinessResult(BaseModel):
     l2_source: str | None = None
     balance_value: str | None = None
     allowance_value: str | None = None
+
+class SubmissionPlan(BaseModel):
+    """
+    Read-only submission plan derived from an ExecutionReadinessResult.
+
+    This model is NOT persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    intent_id: int
+    intent_key: str
+    position_key: str
+    client_order_id: str
+
+    condition_id: str
+    token_id: str
+    outcome: str
+    side: str
+
+    price: float
+    size: float
+    notional: float
+
+    submission_allowed: bool
+    reasons: list[str] = Field(default_factory=list)
+    readiness_snapshot: dict[str, Any] = Field(default_factory=dict)
