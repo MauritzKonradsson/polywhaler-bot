@@ -336,3 +336,151 @@ class ParsedRow:
     impact_text: str | None
     row_index: int | None
     row_html: str | None
+
+class ExecutionIntent(BaseModel):
+    """
+    Persistent execution intent derived from one execution-eligible gate decision.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    intent_key: str
+    canonical_event_id: int
+    lifecycle_key: str
+    position_key: str
+
+    action_type: str
+    intent_status: str
+
+    decision: str
+    execution_eligible: bool = False
+
+    market_slug: str | None = None
+    condition_id: str
+    token_id: str
+    asset: str | None = None
+    outcome: str
+    side: str
+    insider_address: str | None = None
+    source_timestamp_utc: str | None = None
+
+    intended_notional: float | None = None
+    intended_size: float | None = None
+
+    gate_results_json: str | None = None
+    gate_reasons_json: str | None = None
+    resolved_market_json: str | None = None
+    visibility_json: str | None = None
+
+    created_at_utc: str = Field(default_factory=utc_now_iso)
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+
+class OrderAttempt(BaseModel):
+    """
+    Persistent exchange submission attempt linked to one execution intent.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    order_attempt_key: str
+    intent_id: int
+    intent_key: str
+    position_key: str
+
+    client_order_id: str | None = None
+    exchange_order_id: str | None = None
+
+    side: str
+    token_id: str
+    condition_id: str
+    outcome: str
+
+    limit_price: float | None = None
+    requested_size: float | None = None
+    requested_notional: float | None = None
+
+    attempt_status: str
+    raw_request_json: str | None = None
+    raw_response_json: str | None = None
+    error_text: str | None = None
+
+    submitted_at_utc: str | None = None
+    created_at_utc: str = Field(default_factory=utc_now_iso)
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+
+class FillRecord(BaseModel):
+    """
+    Persistent fill record linked to one order attempt and one execution intent.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    fill_key: str
+    intent_id: int
+    order_attempt_id: int
+    position_key: str
+
+    exchange_order_id: str | None = None
+    exchange_trade_id: str | None = None
+
+    side: str
+    token_id: str
+    condition_id: str
+    outcome: str
+
+    fill_price: float
+    fill_size: float
+    fill_notional: float | None = None
+    fee_amount: float | None = None
+    fill_timestamp_utc: str | None = None
+
+    raw_fill_json: str | None = None
+    created_at_utc: str = Field(default_factory=utc_now_iso)
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+
+class PositionRecord(BaseModel):
+    """
+    Persistent local accounting row for one executable position lane.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int | None = None
+    position_key: str
+    lifecycle_key: str
+
+    first_canonical_event_id: int
+    last_canonical_event_id: int
+
+    market_slug: str | None = None
+    condition_id: str
+    token_id: str
+    asset: str | None = None
+    outcome: str
+    side: str
+    insider_address: str | None = None
+
+    position_status: str
+
+    total_filled_size: float = 0.0
+    total_filled_notional: float = 0.0
+    avg_entry_price: float | None = None
+    reserved_notional: float = 0.0
+
+    order_count: int = 0
+    fill_count: int = 0
+
+    opened_at_utc: str | None = None
+    last_activity_at_utc: str | None = None
+    closed_at_utc: str | None = None
+
+    position_payload_json: str | None = None
+
+    created_at_utc: str = Field(default_factory=utc_now_iso)
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
