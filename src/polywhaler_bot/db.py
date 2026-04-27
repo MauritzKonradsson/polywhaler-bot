@@ -12,37 +12,26 @@ from polywhaler_bot.constants import (
 )
 from polywhaler_bot.models import (
     CanonicalEvent,
+    ExecutionIntent,
     LifecycleState,
     NormalizerStateRecord,
     RawFeedEvent,
     RuntimeStateRecord,
 )
 
-# Milestone 2 schema version is intentionally defined here so Step 7.1B can be
-# implemented without requiring any other file changes yet.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 TABLE_CANONICAL_EVENTS = "canonical_events"
 TABLE_LIFECYCLE_STATE = "lifecycle_state"
 TABLE_NORMALIZER_STATE = "normalizer_state"
 
+TABLE_EXECUTION_INTENTS = "execution_intents"
+TABLE_ORDER_ATTEMPTS = "order_attempts"
+TABLE_FILL_RECORDS = "fill_records"
+TABLE_POSITION_RECORDS = "position_records"
+
 
 class StateStore:
-    """
-    SQLite-backed state store.
-
-    Current responsibilities:
-    - initialize and migrate the SQLite schema
-    - persist raw feed events
-    - persist small runtime/session state values
-    - provide lightweight read helpers used by the daemon
-
-    Milestone 2 schema additions:
-    - canonical_events
-    - lifecycle_state
-    - normalizer_state
-    """
-
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,20 +44,15 @@ class StateStore:
         return conn
 
     def initialize(self) -> None:
-        """
-        Creates and/or migrates the schema to the current version.
-
-        This is idempotent:
-        - existing v1 tables/data are preserved
-        - missing v2 tables/indexes are added
-        - schema_meta singleton row is updated to version 2
-        """
         with self.connect() as conn:
             self._create_v1_tables(conn)
             self._create_v1_indexes(conn)
 
             self._create_v2_tables(conn)
             self._create_v2_indexes(conn)
+
+            self._create_v3_tables(conn)
+            self._create_v3_indexes(conn)
 
             self._initialize_or_update_schema_meta(conn)
             conn.commit()
@@ -109,7 +93,6 @@ class StateStore:
             """
         )
 
-        # Single-row schema metadata table; singleton_id must always be 1.
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {TABLE_SCHEMA_META} (
@@ -213,7 +196,6 @@ class StateStore:
         )
 
     def _create_v2_indexes(self, conn: sqlite3.Connection) -> None:
-        # canonical_events
         conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_canonical_events_raw_event_id
@@ -239,7 +221,6 @@ class StateStore:
             """
         )
 
-        # lifecycle_state
         conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_lifecycle_state_current_state
@@ -265,7 +246,157 @@ class StateStore:
             """
         )
 
-        # normalizer_state intentionally has only UNIQUE(state_key); no extra indexes needed.
+    def _create_v3_tables(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_EXECUTION_INTENTS} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_key TEXT NOT NULL UNIQUE,
+                canonical_event_id INTEGER NOT NULL,
+                lifecycle_key TEXT NOT NULL,
+                position_key TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                intent_status TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                execution_eligible INTEGER NOT NULL DEFAULT 0 CHECK (execution_eligible IN (0,1)),
+                market_slug TEXT,
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                asset TEXT,
+                outcome TEXT NOT NULL,
+                side TEXT NOT NULL,
+                insider_address TEXT,
+                source_timestamp_utc TEXT,
+                intended_notional REAL,
+                intended_size REAL,
+                gate_results_json TEXT,
+                gate_reasons_json TEXT,
+                resolved_market_json TEXT,
+                visibility_json TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                FOREIGN KEY(canonical_event_id) REFERENCES {TABLE_CANONICAL_EVENTS}(id)
+            );
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_ORDER_ATTEMPTS} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_attempt_key TEXT NOT NULL UNIQUE,
+                intent_id INTEGER NOT NULL,
+                intent_key TEXT NOT NULL,
+                position_key TEXT NOT NULL,
+                client_order_id TEXT UNIQUE,
+                exchange_order_id TEXT,
+                side TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                limit_price REAL,
+                requested_size REAL,
+                requested_notional REAL,
+                attempt_status TEXT NOT NULL,
+                raw_request_json TEXT,
+                raw_response_json TEXT,
+                error_text TEXT,
+                submitted_at_utc TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                FOREIGN KEY(intent_id) REFERENCES {TABLE_EXECUTION_INTENTS}(id)
+            );
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_FILL_RECORDS} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fill_key TEXT NOT NULL UNIQUE,
+                intent_id INTEGER NOT NULL,
+                order_attempt_id INTEGER NOT NULL,
+                position_key TEXT NOT NULL,
+                exchange_order_id TEXT,
+                exchange_trade_id TEXT,
+                side TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                fill_price REAL NOT NULL,
+                fill_size REAL NOT NULL,
+                fill_notional REAL,
+                fee_amount REAL,
+                fill_timestamp_utc TEXT,
+                raw_fill_json TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                FOREIGN KEY(intent_id) REFERENCES {TABLE_EXECUTION_INTENTS}(id),
+                FOREIGN KEY(order_attempt_id) REFERENCES {TABLE_ORDER_ATTEMPTS}(id)
+            );
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_POSITION_RECORDS} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_key TEXT NOT NULL UNIQUE,
+                lifecycle_key TEXT NOT NULL,
+                first_canonical_event_id INTEGER NOT NULL,
+                last_canonical_event_id INTEGER NOT NULL,
+                market_slug TEXT,
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                asset TEXT,
+                outcome TEXT NOT NULL,
+                side TEXT NOT NULL,
+                insider_address TEXT,
+                position_status TEXT NOT NULL,
+                total_filled_size REAL NOT NULL DEFAULT 0,
+                total_filled_notional REAL NOT NULL DEFAULT 0,
+                avg_entry_price REAL,
+                reserved_notional REAL NOT NULL DEFAULT 0,
+                order_count INTEGER NOT NULL DEFAULT 0,
+                fill_count INTEGER NOT NULL DEFAULT 0,
+                opened_at_utc TEXT,
+                last_activity_at_utc TEXT,
+                closed_at_utc TEXT,
+                position_payload_json TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                FOREIGN KEY(first_canonical_event_id) REFERENCES {TABLE_CANONICAL_EVENTS}(id),
+                FOREIGN KEY(last_canonical_event_id) REFERENCES {TABLE_CANONICAL_EVENTS}(id)
+            );
+            """
+        )
+
+    def _create_v3_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_execution_intents_canonical_event_id ON {TABLE_EXECUTION_INTENTS} (canonical_event_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_execution_intents_lifecycle_key ON {TABLE_EXECUTION_INTENTS} (lifecycle_key);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_execution_intents_position_key ON {TABLE_EXECUTION_INTENTS} (position_key);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_execution_intents_intent_status ON {TABLE_EXECUTION_INTENTS} (intent_status);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_execution_intents_source_timestamp_utc ON {TABLE_EXECUTION_INTENTS} (source_timestamp_utc);")
+
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_order_attempts_intent_id ON {TABLE_ORDER_ATTEMPTS} (intent_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_order_attempts_intent_key ON {TABLE_ORDER_ATTEMPTS} (intent_key);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_order_attempts_position_key ON {TABLE_ORDER_ATTEMPTS} (position_key);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_order_attempts_exchange_order_id ON {TABLE_ORDER_ATTEMPTS} (exchange_order_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_order_attempts_attempt_status ON {TABLE_ORDER_ATTEMPTS} (attempt_status);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_order_attempts_submitted_at_utc ON {TABLE_ORDER_ATTEMPTS} (submitted_at_utc);")
+
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fill_records_intent_id ON {TABLE_FILL_RECORDS} (intent_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fill_records_order_attempt_id ON {TABLE_FILL_RECORDS} (order_attempt_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fill_records_position_key ON {TABLE_FILL_RECORDS} (position_key);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fill_records_exchange_order_id ON {TABLE_FILL_RECORDS} (exchange_order_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fill_records_exchange_trade_id ON {TABLE_FILL_RECORDS} (exchange_trade_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fill_records_fill_timestamp_utc ON {TABLE_FILL_RECORDS} (fill_timestamp_utc);")
+
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_position_records_lifecycle_key ON {TABLE_POSITION_RECORDS} (lifecycle_key);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_position_records_condition_id ON {TABLE_POSITION_RECORDS} (condition_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_position_records_token_id ON {TABLE_POSITION_RECORDS} (token_id);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_position_records_position_status ON {TABLE_POSITION_RECORDS} (position_status);")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_position_records_last_activity_at_utc ON {TABLE_POSITION_RECORDS} (last_activity_at_utc);")
 
     def _initialize_or_update_schema_meta(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -284,9 +415,6 @@ class StateStore:
         )
 
     def insert_raw_event(self, event: RawFeedEvent) -> int:
-        """
-        Persists one RawFeedEvent and returns the inserted row ID.
-        """
         row_json = json.dumps(event.model_dump(mode="json"), ensure_ascii=False)
 
         with self.connect() as conn:
@@ -335,9 +463,6 @@ class StateStore:
             return int(cursor.lastrowid)
 
     def set_runtime_state(self, record: RuntimeStateRecord) -> None:
-        """
-        Upserts one runtime state key/value pair.
-        """
         with self.connect() as conn:
             conn.execute(
                 f"""
@@ -357,9 +482,6 @@ class StateStore:
             conn.commit()
 
     def get_runtime_state(self, state_key: str) -> str | None:
-        """
-        Returns the current value for a runtime state key, or None if missing.
-        """
         with self.connect() as conn:
             row = conn.execute(
                 f"""
@@ -369,14 +491,9 @@ class StateStore:
                 """,
                 (state_key,),
             ).fetchone()
-            if row is None:
-                return None
-            return str(row["state_value"])
+            return None if row is None else str(row["state_value"])
 
     def get_schema_version(self) -> int | None:
-        """
-        Returns the current schema version from the single-row schema_meta table.
-        """
         with self.connect() as conn:
             row = conn.execute(
                 f"""
@@ -385,48 +502,37 @@ class StateStore:
                 WHERE singleton_id = 1;
                 """
             ).fetchone()
-            if row is None:
-                return None
-            return int(row["schema_version"])
+            return None if row is None else int(row["schema_version"])
 
-    def get_normalizer_state(self, state_key: str) -> str | None:
-        """
-        Returns the current value for a normalizer state key, or None if missing.
-        """
+    def count_raw_events(self) -> int:
         with self.connect() as conn:
-            row = conn.execute(
-                f"""
-                SELECT state_value
-                FROM {TABLE_NORMALIZER_STATE}
-                WHERE state_key = ?;
-                """,
-                (state_key,),
-            ).fetchone()
-            if row is None:
-                return None
-            return str(row["state_value"])
+            row = conn.execute(f"SELECT COUNT(*) AS count FROM {TABLE_RAW_EVENTS};").fetchone()
+            return int(row["count"]) if row is not None else 0
 
-    def set_normalizer_state(self, record: NormalizerStateRecord) -> None:
-        """
-        Upserts one normalizer checkpoint key/value pair.
-        """
+    def get_recent_raw_events(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            conn.execute(
+            rows = conn.execute(
                 f"""
-                INSERT INTO {TABLE_NORMALIZER_STATE} (
-                    state_key,
-                    state_value,
-                    updated_at_utc
-                )
-                VALUES (?, ?, ?)
-                ON CONFLICT(state_key)
-                DO UPDATE SET
-                    state_value = excluded.state_value,
-                    updated_at_utc = excluded.updated_at_utc;
+                SELECT *
+                FROM {TABLE_RAW_EVENTS}
+                ORDER BY id DESC
+                LIMIT ?;
                 """,
-                (record.state_key, record.state_value, record.updated_at_utc),
-            )
-            conn.commit()
+                (limit,),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_json = item.get("row_json")
+            if isinstance(raw_json, str):
+                try:
+                    item["row_json"] = json.loads(raw_json)
+                except json.JSONDecodeError:
+                    pass
+            results.append(item)
+
+        return results
 
     def get_raw_events_after_id(
         self,
@@ -434,10 +540,6 @@ class StateStore:
         last_raw_event_id: int,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Returns raw_events with id > last_raw_event_id ordered ascending.
-        row_json is parsed back into a Python object.
-        """
         query = f"""
             SELECT *
             FROM {TABLE_RAW_EVENTS}
@@ -467,13 +569,6 @@ class StateStore:
         return results
 
     def insert_canonical_event(self, event: CanonicalEvent) -> tuple[int | None, bool]:
-        """
-        Inserts a canonical event.
-
-        Returns:
-        - (id, True) if inserted
-        - (existing_id, False) if skipped because event_fingerprint already exists
-        """
         with self.connect() as conn:
             cursor = conn.execute(
                 f"""
@@ -546,6 +641,37 @@ class StateStore:
             existing_id = int(existing["id"]) if existing is not None else None
             return existing_id, False
 
+    def get_normalizer_state(self, state_key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT state_value
+                FROM {TABLE_NORMALIZER_STATE}
+                WHERE state_key = ?;
+                """,
+                (state_key,),
+            ).fetchone()
+            return None if row is None else str(row["state_value"])
+
+    def set_normalizer_state(self, record: NormalizerStateRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {TABLE_NORMALIZER_STATE} (
+                    state_key,
+                    state_value,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(state_key)
+                DO UPDATE SET
+                    state_value = excluded.state_value,
+                    updated_at_utc = excluded.updated_at_utc;
+                """,
+                (record.state_key, record.state_value, record.updated_at_utc),
+            )
+            conn.commit()
+
     def get_lifecycle_processing_state(self, state_key: str) -> str | None:
         return self.get_normalizer_state(state_key)
 
@@ -573,18 +699,21 @@ class StateStore:
         with self.connect() as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
 
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            payload_json = item.get("source_payload_json")
-            if isinstance(payload_json, str):
-                try:
-                    item["source_payload_json"] = json.loads(payload_json)
-                except json.JSONDecodeError:
-                    pass
-            results.append(item)
+        return [self._parse_json_fields(dict(row), ("source_payload_json",)) for row in rows]
 
-        return results
+    def get_recent_canonical_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM {TABLE_CANONICAL_EVENTS}
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [self._parse_json_fields(dict(row), ("source_payload_json",)) for row in rows]
 
     def get_lifecycle_state_by_key(self, lifecycle_key: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -600,27 +729,35 @@ class StateStore:
         if row is None:
             return None
 
-        item = dict(row)
-        payload_json = item.get("state_payload_json")
-        if isinstance(payload_json, str):
-            try:
-                item["state_payload_json"] = json.loads(payload_json)
-            except json.JSONDecodeError:
-                pass
-
-        return item
+        return self._parse_json_fields(dict(row), ("state_payload_json",))
 
     def upsert_lifecycle_state(self, state: LifecycleState) -> int:
         with self.connect() as conn:
             conn.execute(
                 f"""
                 INSERT INTO {TABLE_LIFECYCLE_STATE} (
-                    lifecycle_key, market_text, market_slug, condition_id, asset,
-                    insider_address, insider_display_name, side, current_state,
-                    first_seen_event_id, last_seen_event_id, first_seen_at_utc,
-                    last_seen_at_utc, last_price, last_size, last_total_value,
-                    cumulative_size, cumulative_total_value, event_count,
-                    state_payload_json, created_at_utc, updated_at_utc
+                    lifecycle_key,
+                    market_text,
+                    market_slug,
+                    condition_id,
+                    asset,
+                    insider_address,
+                    insider_display_name,
+                    side,
+                    current_state,
+                    first_seen_event_id,
+                    last_seen_event_id,
+                    first_seen_at_utc,
+                    last_seen_at_utc,
+                    last_price,
+                    last_size,
+                    last_total_value,
+                    cumulative_size,
+                    cumulative_total_value,
+                    event_count,
+                    state_payload_json,
+                    created_at_utc,
+                    updated_at_utc
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(lifecycle_key)
@@ -648,94 +785,177 @@ class StateStore:
                     updated_at_utc = excluded.updated_at_utc;
                 """,
                 (
-                    state.lifecycle_key, state.market_text, state.market_slug,
-                    state.condition_id, state.asset, state.insider_address,
-                    state.insider_display_name, state.side, state.current_state,
-                    state.first_seen_event_id, state.last_seen_event_id,
-                    state.first_seen_at_utc, state.last_seen_at_utc,
-                    state.last_price, state.last_size, state.last_total_value,
-                    state.cumulative_size, state.cumulative_total_value,
-                    state.event_count, state.state_payload_json,
-                    state.created_at_utc, state.updated_at_utc,
+                    state.lifecycle_key,
+                    state.market_text,
+                    state.market_slug,
+                    state.condition_id,
+                    state.asset,
+                    state.insider_address,
+                    state.insider_display_name,
+                    state.side,
+                    state.current_state,
+                    state.first_seen_event_id,
+                    state.last_seen_event_id,
+                    state.first_seen_at_utc,
+                    state.last_seen_at_utc,
+                    state.last_price,
+                    state.last_size,
+                    state.last_total_value,
+                    state.cumulative_size,
+                    state.cumulative_total_value,
+                    state.event_count,
+                    state.state_payload_json,
+                    state.created_at_utc,
+                    state.updated_at_utc,
                 ),
             )
 
             row = conn.execute(
-                f"SELECT id FROM {TABLE_LIFECYCLE_STATE} WHERE lifecycle_key = ?;",
+                f"""
+                SELECT id
+                FROM {TABLE_LIFECYCLE_STATE}
+                WHERE lifecycle_key = ?;
+                """,
                 (state.lifecycle_key,),
             ).fetchone()
             conn.commit()
 
             if row is None:
-                raise RuntimeError(f"Failed to upsert lifecycle_state for {state.lifecycle_key}")
+                raise RuntimeError(f"Failed to upsert lifecycle_state for lifecycle_key={state.lifecycle_key}")
             return int(row["id"])
 
-    def count_raw_events(self) -> int:
-        """
-        Convenience helper for milestone verification.
-        """
+    def upsert_execution_intent(self, intent: ExecutionIntent) -> tuple[int, bool]:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                INSERT OR IGNORE INTO {TABLE_EXECUTION_INTENTS} (
+                    intent_key,
+                    canonical_event_id,
+                    lifecycle_key,
+                    position_key,
+                    action_type,
+                    intent_status,
+                    decision,
+                    execution_eligible,
+                    market_slug,
+                    condition_id,
+                    token_id,
+                    asset,
+                    outcome,
+                    side,
+                    insider_address,
+                    source_timestamp_utc,
+                    intended_notional,
+                    intended_size,
+                    gate_results_json,
+                    gate_reasons_json,
+                    resolved_market_json,
+                    visibility_json,
+                    created_at_utc,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    intent.intent_key,
+                    intent.canonical_event_id,
+                    intent.lifecycle_key,
+                    intent.position_key,
+                    intent.action_type,
+                    intent.intent_status,
+                    intent.decision,
+                    1 if intent.execution_eligible else 0,
+                    intent.market_slug,
+                    intent.condition_id,
+                    intent.token_id,
+                    intent.asset,
+                    intent.outcome,
+                    intent.side,
+                    intent.insider_address,
+                    intent.source_timestamp_utc,
+                    intent.intended_notional,
+                    intent.intended_size,
+                    intent.gate_results_json,
+                    intent.gate_reasons_json,
+                    intent.resolved_market_json,
+                    intent.visibility_json,
+                    intent.created_at_utc,
+                    intent.updated_at_utc,
+                ),
+            )
+
+            if cursor.rowcount == 1:
+                conn.commit()
+                return int(cursor.lastrowid), True
+
+            row = conn.execute(
+                f"""
+                SELECT id
+                FROM {TABLE_EXECUTION_INTENTS}
+                WHERE intent_key = ?;
+                """,
+                (intent.intent_key,),
+            ).fetchone()
+            conn.commit()
+
+            if row is None:
+                raise RuntimeError(f"Failed to upsert execution_intent for intent_key={intent.intent_key}")
+
+            return int(row["id"]), False
+
+    def get_execution_intent_by_key(self, intent_key: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
-                f"SELECT COUNT(*) AS count FROM {TABLE_RAW_EVENTS};"
+                f"""
+                SELECT *
+                FROM {TABLE_EXECUTION_INTENTS}
+                WHERE intent_key = ?;
+                """,
+                (intent_key,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return self._parse_json_fields(
+            dict(row),
+            ("gate_results_json", "gate_reasons_json", "resolved_market_json", "visibility_json"),
+        )
+
+    def count_execution_intents(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM {TABLE_EXECUTION_INTENTS};"
             ).fetchone()
             return int(row["count"]) if row is not None else 0
 
-    def get_recent_raw_events(self, limit: int = 20) -> list[dict[str, Any]]:
-        """
-        Convenience helper for milestone verification/debugging.
-        Returns recent raw events as dictionaries with row_json parsed back into
-        a Python object.
-        """
+    def get_recent_execution_intents(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT *
-                FROM {TABLE_RAW_EVENTS}
+                FROM {TABLE_EXECUTION_INTENTS}
                 ORDER BY id DESC
                 LIMIT ?;
                 """,
                 (limit,),
             ).fetchall()
 
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            raw_json = item.get("row_json")
-            if isinstance(raw_json, str):
+        return [
+            self._parse_json_fields(
+                dict(row),
+                ("gate_results_json", "gate_reasons_json", "resolved_market_json", "visibility_json"),
+            )
+            for row in rows
+        ]
+
+    def _parse_json_fields(self, item: dict[str, Any], field_names: tuple[str, ...]) -> dict[str, Any]:
+        for field_name in field_names:
+            raw_value = item.get(field_name)
+            if isinstance(raw_value, str):
                 try:
-                    item["row_json"] = json.loads(raw_json)
+                    item[field_name] = json.loads(raw_value)
                 except json.JSONDecodeError:
                     pass
-            results.append(item)
+        return item
 
-        return results
-
-    def get_recent_canonical_events(self, limit: int = 20) -> list[dict[str, Any]]:
-        """
-        Convenience helper for market-mapping inspection/debugging.
-        Returns recent canonical_events as dictionaries with source_payload_json
-        parsed back into a Python object when possible.
-        """
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM {TABLE_CANONICAL_EVENTS}
-                ORDER BY id DESC
-                LIMIT ?;
-                """,
-                (limit,),
-            ).fetchall()
-
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            payload_json = item.get("source_payload_json")
-            if isinstance(payload_json, str):
-                try:
-                    item["source_payload_json"] = json.loads(payload_json)
-                except json.JSONDecodeError:
-                    pass
-            results.append(item)
-
-        return results
