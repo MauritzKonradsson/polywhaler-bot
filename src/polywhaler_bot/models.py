@@ -590,3 +590,41 @@ class ExecutionValidationResult(BaseModel):
     token_id: str
     outcome: str
     side: str
+
+class ExecutionReadinessResult(BaseModel):
+    """
+    Read-only authenticated pre-submit readiness result.
+
+    This model is NOT persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    intent_id: int
+    intent_key: str
+    position_key: str
+    client_order_id: str
+
+    ready: bool
+    reasons: list[str] = Field(default_factory=list)
+
+    price: float
+    size: float
+    notional: float
+
+    condition_id: str
+    token_id: str
+    outcome: str
+    side: str
+
+    validation_ok: bool
+    auth_bootstrap_ok: bool
+    balance_readable: bool
+    allowance_readable: bool
+    orderbook_readable: bool
+    existing_live_order_conflict: bool
+
+    funder_address: str | None = None
+    l2_source: str | None = None
+    balance_value: str | None = None
+    allowance_value: str | None = None
