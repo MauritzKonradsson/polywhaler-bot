@@ -13,9 +13,15 @@ from polywhaler_bot.constants import (
 from polywhaler_bot.models import (
     CanonicalEvent,
     ExecutionIntent,
+    FillRecord,
+    GateDecision,
+    InsiderVisibilityResult,
     LifecycleState,
     NormalizerStateRecord,
+    OrderAttempt,
+    PositionRecord,
     RawFeedEvent,
+    ResolvedMarket,
     RuntimeStateRecord,
 )
 
@@ -959,3 +965,123 @@ class StateStore:
                     pass
         return item
 
+    def upsert_order_attempt(self, order_attempt: OrderAttempt) -> tuple[int, bool]:
+        """
+        Idempotent insert/upsert-by-order_attempt_key for order_attempts.
+
+        Returns:
+        - (id, True)  if a new row was inserted
+        - (id, False) if an existing row with the same order_attempt_key already exists
+
+        Existing rows are preserved as-is.
+        """
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                INSERT OR IGNORE INTO {TABLE_ORDER_ATTEMPTS} (
+                    order_attempt_key,
+                    intent_id,
+                    intent_key,
+                    position_key,
+                    client_order_id,
+                    exchange_order_id,
+                    side,
+                    token_id,
+                    condition_id,
+                    outcome,
+                    limit_price,
+                    requested_size,
+                    requested_notional,
+                    attempt_status,
+                    raw_request_json,
+                    raw_response_json,
+                    error_text,
+                    submitted_at_utc,
+                    created_at_utc,
+                    updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    order_attempt.order_attempt_key,
+                    order_attempt.intent_id,
+                    order_attempt.intent_key,
+                    order_attempt.position_key,
+                    order_attempt.client_order_id,
+                    order_attempt.exchange_order_id,
+                    order_attempt.side,
+                    order_attempt.token_id,
+                    order_attempt.condition_id,
+                    order_attempt.outcome,
+                    order_attempt.limit_price,
+                    order_attempt.requested_size,
+                    order_attempt.requested_notional,
+                    order_attempt.attempt_status,
+                    order_attempt.raw_request_json,
+                    order_attempt.raw_response_json,
+                    order_attempt.error_text,
+                    order_attempt.submitted_at_utc,
+                    order_attempt.created_at_utc,
+                    order_attempt.updated_at_utc,
+                ),
+            )
+
+            if cursor.rowcount == 1:
+                conn.commit()
+                return int(cursor.lastrowid), True
+
+            row = conn.execute(
+                f"""
+                SELECT id
+                FROM {TABLE_ORDER_ATTEMPTS}
+                WHERE order_attempt_key = ?;
+                """,
+                (order_attempt.order_attempt_key,),
+            ).fetchone()
+            conn.commit()
+
+            if row is None:
+                raise RuntimeError(
+                    f"Failed to upsert order_attempt for order_attempt_key={order_attempt.order_attempt_key}"
+                )
+
+            return int(row["id"]), False
+
+    def get_recent_order_attempts(self, limit: int = 20) -> list[dict[str, Any]]:
+        """
+        Returns recent order_attempts rows for inspection/debugging.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM {TABLE_ORDER_ATTEMPTS}
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (limit,),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for field_name in ("raw_request_json", "raw_response_json"):
+                raw_value = item.get(field_name)
+                if isinstance(raw_value, str):
+                    try:
+                        item[field_name] = json.loads(raw_value)
+                    except json.JSONDecodeError:
+                        pass
+            results.append(item)
+
+        return results
+
+    def count_order_attempts(self) -> int:
+        """
+        Convenience helper for order_attempts inspection.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM {TABLE_ORDER_ATTEMPTS};"
+            ).fetchone()
+            return int(row["count"]) if row is not None else 0
