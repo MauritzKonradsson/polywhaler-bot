@@ -484,3 +484,30 @@ class PositionRecord(BaseModel):
 
     created_at_utc: str = Field(default_factory=utc_now_iso)
     updated_at_utc: str = Field(default_factory=utc_now_iso)
+
+class ExecutionSizingResult(BaseModel):
+    """
+    Read-only sizing / safety evaluation for one execution intent.
+
+    This is a Milestone 5 model and is not persisted to the DB.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    intent_id: int
+    intent_key: str
+    position_key: str
+
+    allowed: bool
+    intended_notional: float | None = None
+    intended_size: float | None = None
+
+    available_capital: float
+    ceiling_fraction: float = 0.25
+    ceiling_notional: float
+    existing_local_exposure: float
+    remaining_capacity: float
+    minimum_order_notional: float = 2.0
+
+    exposure_snapshot: dict[str, float] = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)

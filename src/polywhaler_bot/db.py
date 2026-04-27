@@ -1085,3 +1085,105 @@ class StateStore:
                 f"SELECT COUNT(*) AS count FROM {TABLE_ORDER_ATTEMPTS};"
             ).fetchone()
             return int(row["count"]) if row is not None else 0
+
+    def get_pending_execution_intents(self, limit: int = 20) -> list[dict[str, Any]]:
+        """
+        Returns recent pending execution_intents rows for sizing/inspection.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM {TABLE_EXECUTION_INTENTS}
+                WHERE intent_status = 'pending'
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (limit,),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for field_name in (
+                "gate_results_json",
+                "gate_reasons_json",
+                "resolved_market_json",
+                "visibility_json",
+            ):
+                raw_value = item.get(field_name)
+                if isinstance(raw_value, str):
+                    try:
+                        item[field_name] = json.loads(raw_value)
+                    except json.JSONDecodeError:
+                        pass
+            results.append(item)
+
+        return results
+
+    def get_local_position_exposure(self, position_key: str) -> dict[str, float]:
+        """
+        Conservatively computes current local exposure for one position_key.
+
+        This intentionally fails closed by summing all known local accounting layers:
+        - execution_intents.intended_notional
+        - order_attempts.requested_notional
+        - position_records.reserved_notional
+        - position_records.total_filled_notional
+
+        This may overcount in some future intermediate states, but that is
+        acceptable for the safety-first baseline in Step 10.4.
+        """
+        with self.connect() as conn:
+            intent_row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(COALESCE(intended_notional, 0)), 0) AS total
+                FROM {TABLE_EXECUTION_INTENTS}
+                WHERE position_key = ?;
+                """,
+                (position_key,),
+            ).fetchone()
+
+            attempt_row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(COALESCE(requested_notional, 0)), 0) AS total
+                FROM {TABLE_ORDER_ATTEMPTS}
+                WHERE position_key = ?;
+                """,
+                (position_key,),
+            ).fetchone()
+
+            position_row = conn.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(COALESCE(reserved_notional, 0)), 0) AS reserved_total,
+                    COALESCE(SUM(COALESCE(total_filled_notional, 0)), 0) AS filled_total
+                FROM {TABLE_POSITION_RECORDS}
+                WHERE position_key = ?;
+                """,
+                (position_key,),
+            ).fetchone()
+
+        intent_notional = float(intent_row["total"]) if intent_row is not None else 0.0
+        order_attempt_notional = float(attempt_row["total"]) if attempt_row is not None else 0.0
+        position_reserved_notional = (
+            float(position_row["reserved_total"]) if position_row is not None else 0.0
+        )
+        position_filled_notional = (
+            float(position_row["filled_total"]) if position_row is not None else 0.0
+        )
+
+        combined_exposure_notional = (
+            intent_notional
+            + order_attempt_notional
+            + position_reserved_notional
+            + position_filled_notional
+        )
+
+        return {
+            "intent_notional": intent_notional,
+            "order_attempt_notional": order_attempt_notional,
+            "position_reserved_notional": position_reserved_notional,
+            "position_filled_notional": position_filled_notional,
+            "combined_exposure_notional": combined_exposure_notional,
+        }
